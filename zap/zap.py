@@ -86,7 +86,7 @@ def process(musecubefits, outcubefits='DATACUBE_ZAP.fits', clean=True,
             zlevel='median', cftype='weight', cfwidthSVD=300, cfwidthSP=300,
             nevals=[], extSVD=None, skycubefits=None, mask=None,
             interactive=False, ncpu=None, pca_class=None, n_components=None,
-            overwrite=False, varcurvefits=None):
+            overwrite=False, varcurvefits=None, ignore_spec=None):
     """ Performs the entire ZAP sky subtraction algorithm.
 
     This is the main ZAP function. It works on an input FITS file and
@@ -178,7 +178,8 @@ def process(musecubefits, outcubefits='DATACUBE_ZAP.fits', clean=True,
         # will be computed in the _run method, which allows to avoid running
         # twice the zlevel and continuumfilter steps.
         extSVD = SVDoutput(musecubefits, clean=clean, zlevel=zlevel,
-                           cftype=cftype, cfwidth=cfwidthSVD, mask=mask)
+                           cftype=cftype, cfwidth=cfwidthSVD, mask=mask,
+                           ignore_spec=ignore_spec)
 
     zobj = Zap(musecubefits, pca_class=pca_class, n_components=n_components)
     zobj._run(clean=clean, zlevel=zlevel, cfwidth=cfwidthSP, cftype=cftype,
@@ -200,7 +201,7 @@ def process(musecubefits, outcubefits='DATACUBE_ZAP.fits', clean=True,
 
 def SVDoutput(musecubefits, clean=True, zlevel='median', cftype='weight',
               cfwidth=300, mask=None, ncpu=None, pca_class=None,
-              n_components=None):
+              n_components=None, ignore_spec=None):
     """Performs the SVD decomposition of a datacube.
 
     This allows to use the SVD for a different datacube. It used to allow to
@@ -235,7 +236,7 @@ def SVDoutput(musecubefits, clean=True, zlevel='median', cftype='weight',
 
     zobj = Zap(musecubefits, pca_class=pca_class, n_components=n_components)
     zobj._prepare(clean=clean, zlevel=zlevel, cftype=cftype,
-                  cfwidth=cfwidth, mask=mask)
+                  cfwidth=cfwidth, mask=mask, ignore_spec=ignore_spec)
     zobj._msvd()
     return zobj
 
@@ -434,7 +435,7 @@ class Zap(object):
 
     @timeit
     def _prepare(self, clean=True, zlevel='median', cftype='weight',
-                 cfwidth=300, extzlevel=None, mask=None):
+                 cfwidth=300, extzlevel=None, mask=None, ignore_spec=None):
         # Check for consistency between weighted median and zlevel keywords
         if cftype == 'weight' and zlevel == 'none':
             raise ValueError('Weighted median requires a zlevel calculation')
@@ -450,6 +451,18 @@ class Zap(object):
         # Extract the spectra that we will be working with
         self._extract()
 
+        if ignore_spec is not None:
+            print('IGNORE SPEC!!')
+            V = fits.getdata(ignore_spec)[:, None]
+            print(V.shape)
+            res = []
+            for sp in self.stack.T:
+                ortho = sp - np.linalg.multi_dot([V, np.linalg.inv(V.T @ V),
+                                                  V.T, sp])
+                res.append(ortho)
+            self.stack = np.stack(res).T.reshape(self.stack.shape)
+            print('DONE')
+
         # remove the median along the spectral axis
         if extzlevel is None:
             if zlevel.lower() != 'none':
@@ -464,7 +477,7 @@ class Zap(object):
         self._normalize_variance()
 
     def _run(self, clean=True, zlevel='median', cftype='weight',
-             cfwidth=300, nevals=[], extSVD=None):
+             cfwidth=300, nevals=[], extSVD=None, ignore_spec=None):
         """ Perform all steps to ZAP a datacube:
 
         - NaN re/masking,
@@ -479,7 +492,8 @@ class Zap(object):
 
         """
         self._prepare(clean=clean, zlevel=zlevel, cftype=cftype,
-                      cfwidth=cfwidth, extzlevel=extSVD)
+                      cfwidth=cfwidth, extzlevel=extSVD,
+                      ignore_spec=ignore_spec)
 
         # do the multiprocessed SVD calculation
         if extSVD is None:
