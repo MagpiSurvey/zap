@@ -9,25 +9,6 @@ data.  The method uses PCA to isolate the residual sky subtraction features and
 remove them from the observed datacube. ZAP was designed for MUSE data and has
 been used sucessfully on KCWI and Subaru/FOCAS data.
 
-The last stable release of ZAP can be installed simply with pip::
-
-    pip install zap
-
-Or into the user path with::
-
-    pip install --user zap
-
-Links
-~~~~~
-
-- `documentation <http://zap.readthedocs.io/en/latest/>`_
-
-- `git repository <https://github.com/musevlt/zap>`_
-
-- `changelog <https://github.com/musevlt/zap/blob/master/CHANGELOG>`_
-
-- `pypi <https://pypi.org/project/zap/>`_
-
 Citation
 ~~~~~~~~
 
