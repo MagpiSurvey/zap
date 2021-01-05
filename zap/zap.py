@@ -35,7 +35,9 @@ from astropy.wcs import WCS
 from functools import wraps
 from multiprocessing import cpu_count, Manager, Process
 from scipy.stats import sigmaclip
+from astropy.stats import mad_std
 from sklearn.decomposition import PCA
+from sklearn.decomposition._base import _BasePCA
 from time import time
 
 from pkg_resources import get_distribution, DistributionNotFound
@@ -77,7 +79,7 @@ logger = logging.getLogger(__name__)
 
 # ================= Top Level Functions =================
 
-def process(cubefits, outcubefits='DATACUBE_ZAP.fits', clean=True,
+def process(cubefits, cube=None, hdr=None, outcubefits='DATACUBE_ZAP.fits', clean=True,
             zlevel='median', cftype='median', cfwidthSVD=300, cfwidthSP=300,
             nevals=[], extSVD=None, skycubefits=None, mask=None,
             interactive=False, ncpu=None, pca_class=None, n_components=None,
@@ -174,7 +176,8 @@ def process(cubefits, outcubefits='DATACUBE_ZAP.fits', clean=True,
         extSVD = SVDoutput(cubefits, clean=clean, zlevel=zlevel,
                            cftype=cftype, cfwidth=cfwidthSVD, mask=mask)
 
-    zobj = Zap(cubefits, pca_class=pca_class, n_components=n_components)
+    zobj = Zap(cubefits, pca_class=pca_class, n_components=n_components,
+               cube=cube, hdr=hdr)
     zobj._run(clean=clean, zlevel=zlevel, cfwidth=cfwidthSP, cftype=cftype,
               nevals=nevals, extSVD=extSVD)
 
@@ -194,7 +197,7 @@ def process(cubefits, outcubefits='DATACUBE_ZAP.fits', clean=True,
 
 def SVDoutput(cubefits, clean=True, zlevel='median', cftype='median',
               cfwidth=300, mask=None, ncpu=None, pca_class=None,
-              n_components=None):
+              n_components=None, cube=None, hdr=None, stack=None):
     """Performs the SVD decomposition of a datacube.
 
     This allows to use the SVD for a different datacube. It used to allow to
@@ -218,7 +221,12 @@ def SVDoutput(cubefits, clean=True, zlevel='median', cftype='median',
         Window size for the continuum filter, default to 300.
     mask : str
         Path of a FITS file containing a mask (1 for objects, 0 for sky).
-
+    stack : numpy.ndarray
+        Optional input for a 2D "stack" of spectra to use for generating SVD. If
+        supplied then this ignores the file provided using the cubefits keyword and
+        overides the internally generated spectral stack. The provided spectra 
+        already have NaN values cleaned, as this bypasses some of the internal
+        ZAP processes.
     """
     logger.info('Processing %s to compute the SVD', cubefits)
 
@@ -226,9 +234,10 @@ def SVDoutput(cubefits, clean=True, zlevel='median', cftype='median',
         global NCPU
         NCPU = ncpu
 
-    zobj = Zap(cubefits, pca_class=pca_class, n_components=n_components)
+    zobj = Zap(cubefits, pca_class=pca_class, n_components=n_components,
+               cube=cube, hdr=hdr)
     zobj._prepare(clean=clean, zlevel=zlevel, cftype=cftype,
-                  cfwidth=cfwidth, mask=mask)
+                  cfwidth=cfwidth, mask=mask, stack=stack)
     zobj._msvd()
     return zobj
 
@@ -339,24 +348,31 @@ class Zap(object):
 
     """
 
-    def __init__(self, cubefits, pca_class=None, n_components=None):
+    def __init__(self, cubefits, pca_class=None, n_components=None,
+                 cube=None, hdr=None):
         self.cubefits = cubefits
         self.ins_mode = None
 
-        with fits.open(cubefits) as hdul:
-            self.instrument = hdul[0].header.get('INSTRUME')
-            if self.instrument == 'MUSE':
-                self.ins_mode = hdul[0].header.get('HIERARCH ESO INS MODE')
-                self.cube = hdul[1].data
-                self.header = hdul[1].header
-            elif self.instrument == 'KCWI':
-                self.cube = hdul[0].data
-                self.header = hdul[0].header
-            elif self.instrument == 'FOCAS':
-                self.cube = hdul[0].data
-                self.header = hdul[0].header
-            else:
-                raise ValueError('unsupported instrument %s' % self.instrument)
+        if cube is not None: #in case that a cube is supplied directly
+            self.cube = cube
+            self.header = hdr
+            self.ins_mode=None
+            self.instrument = 'MUSE' #hard-coded to MUSE for now...
+        else:
+            with fits.open(cubefits) as hdul:
+                self.instrument = hdul[0].header.get('INSTRUME')
+                if self.instrument == 'MUSE':
+                    self.ins_mode = hdul[0].header.get('HIERARCH ESO INS MODE')
+                    self.cube = hdul[1].data
+                    self.header = hdul[1].header
+                elif self.instrument == 'KCWI':
+                    self.cube = hdul[0].data
+                    self.header = hdul[0].header
+                elif self.instrument == 'FOCAS':
+                    self.cube = hdul[0].data
+                    self.header = hdul[0].header
+                else:
+                    raise ValueError('unsupported instrument %s' % self.instrument)
 
         # Workaround for floating points errors in wcs computation: if cunit is
         # specified, wcslib will convert in meters instead of angstroms, so we
@@ -366,7 +382,11 @@ class Zap(object):
         self.wcs = WCS(header).sub([3])
 
         # Create Lambda axis
-        wlaxis = np.arange(self.cube.shape[0])
+        try:
+            wlaxis = np.arange(self.cube.shape[0])
+        except AttributeError:
+            wlaxis = np.arange(self.header['NAXIS3'])
+
         self.laxis = self.wcs.all_pix2world(wlaxis, 0)[0]
         if unit != u.angstrom:
             # Make sure lambda is in angstroms
@@ -398,6 +418,7 @@ class Zap(object):
 
         # Extraction results
         self.stack = None
+        self.sigma_mask = None
         self.y = None
         self.x = None
 
@@ -441,7 +462,7 @@ class Zap(object):
 
     @timeit
     def _prepare(self, clean=True, zlevel='median', cftype='median',
-                 cfwidth=300, extzlevel=None, mask=None):
+                 cfwidth=300, extzlevel=None, mask=None, stack=None):
         # clean up the nan values
         if clean:
             self._nanclean()
@@ -451,7 +472,10 @@ class Zap(object):
             self._applymask(mask)
 
         # Extract the spectra that we will be working with
-        self._extract()
+        if stack is None:
+            self._extract()
+        else:
+            self.stack = stack
 
         # remove the median along the spectral axis
         if extzlevel is None:
@@ -462,6 +486,9 @@ class Zap(object):
 
         # remove the continuum level - this is multiprocessed to speed it up
         self._continuumfilter(cfwidth=cfwidth, cftype=cftype)
+
+        # flag deviant pixels in the continuum-cleaned spectra
+        self._flag_pixels()
 
         # normalize the variance in the segments.
         self._normalize_variance()
@@ -487,8 +514,11 @@ class Zap(object):
         # do the multiprocessed SVD calculation
         if extSVD is None:
             self._msvd()
-        else:
+        elif isinstance(extSVD, Zap):
             self.models = extSVD.models
+        else:
+            self.models = self.readPCA(extSVD)
+            self.flag_extSVD = True
 
         self.components = [m.components_.copy() for m in self.models]
 
@@ -536,6 +566,28 @@ class Zap(object):
         self.stack = self.cube[:, self.y, self.x]
         logger.info('Extract to 2D, %d valid spaxels (%d%%)', len(self.x),
                     len(self.x) / np.prod(self.cube.shape[1:]) * 100)
+
+    def _flag_pixels(self):
+        #setup masked array for inversion
+        mstack = np.nanmedian(self.normstack, axis=1)
+        dev = np.clip(mad_std(self.normstack, axis=1, ignore_nan=True), 1e-10, None)
+        self.sigma_mask = (np.fabs(self.normstack-mstack[:,np.newaxis])/dev[:,np.newaxis] > 6.)
+
+        #iteratively clean pixels for reconstruction
+        for ii in range(5):
+            old_mask = np.copy(self.sigma_mask)
+            tarray = np.copy(self.normstack)
+            tarray[self.sigma_mask] = np.nan
+
+            mstack = np.nanmedian(tarray, axis=1)
+            dev = np.clip(mad_std(tarray, axis=1, ignore_nan=True), 1e-10, None)
+            self.sigma_mask = (np.fabs(self.normstack-mstack[:,np.newaxis])/dev[:,np.newaxis] > 6.)
+            if np.all(self.sigma_mask == old_mask):
+                break
+
+        logger.info('Flagged %d pixels to mask during reconstruction', 
+                    np.count_nonzero(self.sigma_mask)) 
+
 
     def _externalzlevel(self, extSVD):
         """Remove the zero level from the extSVD file."""
@@ -694,6 +746,24 @@ class Zap(object):
         for i, model in enumerate(self.models):
             model.components_ = self.components[i][start[i]:end[i]]
 
+#    @timeit
+#    def reconstruct(self):
+#        """Reconstruct the residuals from a given set of eigenspectra and
+#        eigenvalues
+#        """
+#        logger.info('Reconstructing Sky Residuals')
+#        indices = [x[0] for x in self.pranges[1:]]
+#        # normstack = self.stack - self.contarray
+#        Xarr = np.array_split(self.normstack.T, indices, axis=1)
+#        Xnew = [model.transform(x)
+#                for model, x in zip(self.models, Xarr)]
+#        Xinv = [model.inverse_transform(x)
+#                for model, x in zip(self.models, Xnew)]
+#        self.recon = np.concatenate([x.T * self.variancearray[i, :]
+#                                     for i, x in enumerate(Xinv)])
+#        # self.recon = np.concatenate([x.T for x in Xinv])
+#        # self.recon *= self.variancearray[:, np.newaxis]
+
     @timeit
     def reconstruct(self):
         """Reconstruct the residuals from a given set of eigenspectra and
@@ -701,16 +771,25 @@ class Zap(object):
         """
         logger.info('Reconstructing Sky Residuals')
         indices = [x[0] for x in self.pranges[1:]]
-        # normstack = self.stack - self.contarray
-        Xarr = np.array_split(self.normstack.T, indices, axis=1)
-        Xnew = [model.transform(x)
-                for model, x in zip(self.models, Xarr)]
-        Xinv = [model.inverse_transform(x)
-                for model, x in zip(self.models, Xnew)]
+
+        normstack_ma = np.ma.masked_array(self.normstack, mask=self.sigma_mask)
+
+        if self.flag_extSVD:
+            Xarr = np.array_split(normstack_ma.T, indices, axis=1)
+            Xnew = [model.transform_ma(x)
+                    for model, x in zip(self.models, Xarr)]
+            Xinv = [model.inverse_transform_ma(x)
+                    for model, x in zip(self.models, Xnew)]
+        else:
+            Xarr = np.array_split(self.normstack.T, indices, axis=1)
+            Xnew = [model.transform(x)
+                    for model, x in zip(self.models, Xarr)]
+            Xinv = [model.inverse_transform(x)
+                    for model, x in zip(self.models, Xnew)]
+        
+
         self.recon = np.concatenate([x.T * self.variancearray[i, :]
                                      for i, x in enumerate(Xinv)])
-        # self.recon = np.concatenate([x.T for x in Xinv])
-        # self.recon *= self.variancearray[:, np.newaxis]
 
     def make_cube_from_stack(self, stack, with_nans=False):
         """Stuff the stack back into a cube."""
@@ -829,6 +908,63 @@ class Zap(object):
 
             hdu.writeto(outcubefits, overwrite=overwrite)
         logger.info('Cube file saved to %s', outcubefits)
+
+    def writePCA(self, pcaoutputfits='ZAP_PCA.fits', overwrite=False):
+        """Write critical PCA information to a fits file."""
+        if not overwrite:
+            _check_file_exists(pcaoutputfits)
+
+        header = fits.Header()
+        header['ZAPvers'] = (__version__, 'ZAP version')
+        header['ZAPzlvl'] = (self.run_zlevel, 'ZAP zero level correction')
+        header['ZAPclean'] = (self.run_clean,
+                          'ZAP NaN cleaning performed for calculation')
+        header['ZAPcftyp'] = (self._cftype, 'ZAP continuum filter type')
+        header['ZAPcfwid'] = (self._cfwidth, 'ZAP continuum filter size')
+        header['ZAPmask'] = (self.maskfile, 'ZAP mask used to remove sources')
+        nseg = len(self.models)
+        header['ZAPnseg'] = (nseg, 'Number of segments used for ZAP SVD')
+
+        hdu = fits.HDUList([fits.PrimaryHDU(data=self.zlsky, header=header)])
+        for i, model in enumerate(self.models):
+            thead = fits.Header()
+            thead['Whiten'] = model.whiten
+            hdu.append(fits.ImageHDU(data=model.mean_, header=thead))
+            hdu.append(fits.ImageHDU(data=model.explained_variance_))
+            hdu.append(fits.ImageHDU(data=model.components_))
+
+        # write for later use
+        hdu.writeto(pcaoutputfits,overwrite=overwrite)
+        
+        logger.info('PCA components saved to %s', pcaoutputfits)
+
+    def readPCA(self, pcainputfits):
+        """Read int stored PCA information."""
+
+        if not os.path.exists(pcainputfits):
+            raise IOError("The requested PCA file does not exist")
+
+        hdu = fits.open(pcainputfits)
+
+        #check that the input array has the same number of segments
+        nseg = hdu[0].header['ZAPnseg']
+        if nseg != len(self.pranges):
+            raise AttributeError("The input PCA array was generated with different segments")
+
+        self.zlsky = hdu[0].data
+        models = []
+        for i in range(nseg):
+            wht = hdu[(3*i)+1].header['whiten']
+            temp_mean = hdu[(3*i)+1].data
+            temp_var = hdu[(3*i)+2].data
+            temp_comp = hdu[(3*i)+3].data
+
+            models.append(PCAobj(mean=temp_mean, var=temp_var, comp=temp_comp, whiten=wht))
+        hdu.close()
+
+        logger.info('PCA components read from %s', os.path.split(pcainputfits)[1])
+
+        return models
 
     def plotvarcurve(self, i=0, ax=None):
         var = self.models[i].explained_variance_
@@ -1073,3 +1209,48 @@ def _nanclean(cube, rejectratio=0.25, boxsz=1):
 
     cleancube[z, y, x] = np.nanmean(neighbor, axis=1)
     return cleancube, badcube
+
+
+# ====== Included for PCA I/O ======
+class PCAobj(_BasePCA):
+    def __init__(self, mean=None, var=None, comp=None, whiten=False):
+        self.components_ = comp
+        self.explained_variance_ = var
+        self.mean_ = mean
+        self.whiten=whiten
+
+    def fit(self):
+        pass
+
+    #include transform methods which work on masked arrays to deal with catastrophic
+    #outliers in the spectra
+    def transform_ma(self, X):
+        """Apply dimensionality reduction to X.
+        X is projected on the first principal components 
+        previously extracted from a training set.
+
+        Modified from the standard sklearn routine to use
+        masked array routines
+        """
+        if self.mean_ is not None:
+            X = X - self.mean_
+        X_transformed = np.array(np.ma.dot(X, self.components_.T))
+        if self.whiten:
+            X_transformed /= np.sqrt(self.explained_variance_)
+        return X_transformed
+
+    def inverse_transform_ma(self, X):
+        """Transform data back to its original space.
+        In other words, return an input X_original whose transform would be X.
+
+        Modified from the standard sklearn routine to use
+        masked array routines
+        """
+        if self.whiten:
+            return np.array(np.ma.dot(X, np.sqrt(self.explained_variance_[:, np.newaxis]) *
+                            self.components_)) + self.mean_
+        else:
+            return np.array(np.ma.dot(X, self.components_)) + self.mean_
+
+
+
